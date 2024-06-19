@@ -1,31 +1,32 @@
-from fastapi import FastAPI,File,UploadFile,Form
+from fastapi import FastAPI, File, UploadFile, Form
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing_extensions import Annotated
-
-import os
-from groq import Groq
-from fastapi.middleware.cors import CORSMiddleware
-
 from docx import Document
 from PyPDF2 import PdfReader
 from pathlib import Path
+import os
+from groq import Groq
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+import traceback
 
 UPLOAD_DIR = Path() / "upload"
 
 client = Groq(
-    api_key="GORQ_API_KEY",
+    api_key="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",
 )
 
 class Data(BaseModel):
-    file : UploadFile
-    userPrompt : str | None = None
-
+    file: UploadFile
+    userPrompt: str | None = None
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins= ["*"],
+    allow_origins=["*"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -33,52 +34,52 @@ app.add_middleware(
 
 @app.get("/health")
 def read_root():
-    print("Health Check")
     return {"status": "ok"}
 
-    if docs.data == "":
-        return {"error": "File is required"}
-    else: 
-
-        content = "Role: You are the Q&A solver. Here is your information: Data: " + docs.data + "Using this information, answer the following question: Question:"+ docs.userPrompt + "Instruction: Answer the question using the information provided in the data."
-        try : 
-            chat_completion = client.chat.completions.create(
-                messages=[
-                    {
-                        "role": "user",
-                        "content": content,
-                    }
-                ],
-                model="llama3-8b-8192",
-            )
-            return chat_completion.choices[0].message.content
-        except :
-            return {"error": str(e)}
-
-
-def extract_text_from_pdf(file_data):
+def extract_text_from_pdf(file_path):
     reader = PdfReader(file_path)
-    number_of_pages = len(reader.pages)
     text = ""
     for page in reader.pages:
-        text += page.extract_text()
-    print(text)
+        text += page.extract_text() or ""
     return text
 
-def extract_text_from_docx(file_data):
-    doc = Document(file_data)
-    print("Docs File Read")
-    para = doc.paragraphs
+def extract_text_from_docx(file_path):
+    doc = Document(file_path)
     text = ""
-    for p in para:
-        text += p.text
-    print(text)
+    for para in doc.paragraphs:
+        text += para.text
     return text
 
-def extract_text_from_txt(file_data):
-    with open(file_data, "r") as f:
+def extract_text_from_txt(file_path):
+    with open(file_path, "r") as f:
         text = f.read()
     return text
+
+def chunk_text(text, chunk_size=500):
+    words = text.split()
+    return [' '.join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+
+class DocumentStore:
+    def __init__(self):
+        self.documents = []
+        self.vectorizer = TfidfVectorizer()
+        self.document_matrix = None
+
+    def add_document(self, text):
+        new_chunks = chunk_text(text)
+        self.documents.extend(new_chunks)
+        self.document_matrix = self.vectorizer.fit_transform(self.documents)
+
+    def query(self, userPrompt, top_k=5):
+        if not self.documents:
+            return []
+
+        query_vector = self.vectorizer.transform([userPrompt])
+        similarities = cosine_similarity(query_vector, self.document_matrix).flatten()
+        indices = similarities.argsort()[-top_k:][::-1]
+        return [self.documents[i] for i in indices]
+
+store = DocumentStore()
 
 @app.post("/summarize")
 async def file_summary(
@@ -98,27 +99,44 @@ async def file_summary(
         elif upload_file.filename.endswith(".txt"):
             text = extract_text_from_txt(file_path)
         else:
+            os.remove(file_path)
             return {"error": "Unsupported file type"}
         
         os.remove(file_path)
 
+        store.add_document(text)
+
+        if not userPrompt:
+            userPrompt = ""
+
+        relevant_chunks = store.query(userPrompt, top_k=5)
+        combined_text = " ".join(relevant_chunks)
+
+        max_tokens = 3000 
+        tokens = combined_text.split()
+        if len(tokens) > max_tokens:
+            combined_text = " ".join(tokens[:max_tokens])
+
         content = (
             f"Instruction: You are a summary generator, your job is to generate a summary of the given data. "
             f"You have to follow the instructions given on how to generate the summary. If no instruction is given, "
-            f"then just generate the summary. Data: {text} Instruction: {userPrompt} "
+            f"then just generate the summary. Data: {combined_text} Instruction: {userPrompt} "
             f"Instruction: The summary should be at least 200 words long."
         )
 
-        # Assuming client.chat.completions.create is defined elsewhere
         chat_completion = client.chat.completions.create(
             messages=[{"role": "user", "content": content}],
-            model="llama3-8b-8192",
+            model="mixtral-8x7b-32768",
         )
 
-        return chat_completion.choices[0].message.content
+        summary = chat_completion.choices[0].message.content
+        print("Summary:", summary)  ##Debugging summary
+        return {"summary": summary}
+    
     except Exception as e:
-        return {"error": str(e)}
-
+        error_trace = traceback.format_exc()
+        print("Error:", error_trace)  
+        return {"error": "An error occurred while processing your request. Please check the server logs for more details."}
 
 @app.post("/chat")
 async def file_chat(
@@ -138,18 +156,41 @@ async def file_chat(
         elif upload_file.filename.endswith(".txt"):
             text = extract_text_from_txt(file_path)
         else:
+            os.remove(file_path)
             return {"error": "Unsupported file type"}
         
         os.remove(file_path)
 
-        content = "Role: You are the Q&A solver. Here is your information: Data: " + text + "Using this information, answer the following question: Question:"+ userPrompt + "Instruction: Answer the question using the information provided in the data."
+        store.add_document(text)
 
-        # Assuming client.chat.completions.create is defined elsewhere
+        if not userPrompt:
+            userPrompt = ""
+
+        relevant_chunks = store.query(userPrompt, top_k=5)
+        combined_text = " ".join(relevant_chunks)
+
+        # Token size for chunks
+        max_tokens = 3000 
+        tokens = combined_text.split()
+        if len(tokens) > max_tokens:
+            combined_text = " ".join(tokens[:max_tokens])
+
+        content = (
+            f"Role: You are the Q&A solver. Here is your information: Data: {combined_text} "
+            f"Using this information, answer the following question: Question: {userPrompt} "
+            f"Instruction: Answer the question using the information provided in the data."
+        )
+
         chat_completion = client.chat.completions.create(
             messages=[{"role": "user", "content": content}],
             model="mixtral-8x7b-32768",
         )
 
-        return chat_completion.choices[0].message.content
+        answer = chat_completion.choices[0].message.content
+        print("Answer:", answer)  # Debugging
+        return {"answer": answer}
+    
     except Exception as e:
-        return {"error": str(e)}
+        error_trace = traceback.format_exc()
+        print("Error:", error_trace)  
+        return {"error": "An error occurred while processing your request. Please check the server logs for more details."}
